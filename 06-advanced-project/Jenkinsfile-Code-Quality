@@ -24,7 +24,12 @@ pipeline {
 
         stage('Test') {
             steps {
-                sh "poetry run pytest"
+                sh '''
+                    set -eux
+                    cd "$WORKSPACE"
+                    export PATH="$HOME/.local/bin:$PATH"
+                    poetry run pytest
+                '''
             }
         }    
     }
