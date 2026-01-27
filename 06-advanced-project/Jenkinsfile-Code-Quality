@@ -18,18 +18,26 @@ pipeline {
         }            
         stage('Setup') {
             steps {
-                sh "poetry install --with dev"
+                sh '''
+                set -eux
+                cd "$WORKSPACE"
+
+                # Install Poetry
+                curl -sSL https://install.python-poetry.org | python3 -
+
+                # Use Poetry via Python module (NOT binary lookup)
+                python3 -m poetry install --with dev
+        '''
             }
         }
 
         stage('Test') {
             steps {
                 sh '''
-                    set -eux
-                    cd "$WORKSPACE"
-                    export PATH="$HOME/.local/bin:$PATH"
-                    poetry run pytest
-                '''
+                set -eux
+                cd "$WORKSPACE"
+                python3 -m poetry run pytest
+        '''
             }
         }    
     }
