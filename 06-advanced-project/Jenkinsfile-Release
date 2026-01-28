@@ -6,82 +6,48 @@ pipeline {
         ACR_NAME         = 'jekinsreg'
         ACR_LOGIN_SERVER = 'jekinsreg.azurecr.io'
         IMAGE_NAME       = "${ACR_LOGIN_SERVER}/jenkins-flask-app"
-        IMAGE_TAG        = "${IMAGE_NAME}:${env.GIT_COMMIT}"
 
         // AKS
         AKS_CLUSTER = 'jenkins-demo'
         AKS_RG      = 'shub-poc-rg'
 
-        // GitHub (required for semantic-release push)
+        // GitHub (for semantic-release)
         GH_TOKEN = credentials('github-access-token')
     }
 
     stages {
 
-        stage('Check for Git Tag') {
-            steps {
-                script {
-                    def tag = sh(returnStdout: true, script: "git tag --contains || true").trim()
-                    env.GIT_TAG = tag ?: ""
-                    env.IMAGE_TAG_RELEASE = env.GIT_TAG ? "${IMAGE_NAME}:${env.GIT_TAG}" : ""
-                    echo "GIT_TAG=${env.GIT_TAG}"
-                }
-            }
-        }
-
-        stage('Setup Poetry') {
-            steps {
-                sh '''
-                    set -eux
-                    cd "$WORKSPACE/06-advanced-project"
-                    /var/lib/jenkins/.local/bin/poetry --version
-                    /var/lib/jenkins/.local/bin/poetry install --with dev
-                '''
-            }
-        }
-
-        stage('Fix Git Checkout') {
-            steps {
-                sh '''
-                    set -eux
-                    git fetch origin main --tags
-                    git checkout -B main origin/main
-                    git branch --show-current
-                '''
-            }
-        }
-
-        stage('GitHub Auth Setup') {
-            steps {
-                sh '''
-                    set -eux
-                    git config --global user.email "jenkins@ci.local"
-                    git config --global user.name "jenkins-bot"
-                    git remote set-url origin https://${GH_TOKEN}@github.com/shubhama-d/jenkins-project.git
-                '''
-            }
-        }
-
-        stage('Create Release') {
+        /* ---------------- RELEASE STAGE ---------------- */
+        stage('Create Release (main branch only)') {
             when {
                 allOf {
                     branch 'main'
-                    expression { env.GIT_TAG == "" }
+                    not { buildingTag() }
                 }
             }
             steps {
                 sh '''
                     set -eux
                     cd "$WORKSPACE/06-advanced-project"
+
+                    git config --global user.email "jenkins@ci.local"
+                    git config --global user.name "jenkins-bot"
+
+                    /var/lib/jenkins/.local/bin/poetry install --with dev
                     /var/lib/jenkins/.local/bin/poetry run semantic-release version
                     /var/lib/jenkins/.local/bin/poetry run semantic-release publish
                 '''
             }
         }
 
-        stage('Build and Deploy') {
+        /* ---------------- BUILD & DEPLOY STAGE ---------------- */
+        stage('Build & Deploy (tag only)') {
             when {
-                expression { env.GIT_TAG != "" }
+                buildingTag()
+            }
+
+            environment {
+                IMAGE_TAG = "${IMAGE_NAME}:${env.TAG_NAME}"
             }
 
             stages {
@@ -89,19 +55,20 @@ pipeline {
                 stage('Azure Login') {
                     steps {
                         withCredentials([
-                            usernamePassword(
-                                credentialsId: 'azure-sp',
+                            usernamePassword(credentialsId: 'azure-sp',
                                 usernameVariable: 'AZURE_CLIENT_ID',
-                                passwordVariable: 'AZURE_CLIENT_SECRET'
-                            ),
-                            string(credentialsId: 'azure-tenant-id', variable: 'AZURE_TENANT_ID'),
-                            string(credentialsId: 'azure-subscription-id', variable: 'AZURE_SUBSCRIPTION_ID')
+                                passwordVariable: 'AZURE_CLIENT_SECRET'),
+                            string(credentialsId: 'azure-tenant-id',
+                                variable: 'AZURE_TENANT_ID'),
+                            string(credentialsId: 'azure-subscription-id',
+                                variable: 'AZURE_SUBSCRIPTION_ID')
                         ]) {
                             sh '''
                                 az login --service-principal \
-                                  --username $AZURE_CLIENT_ID \
-                                  --password $AZURE_CLIENT_SECRET \
+                                  -u $AZURE_CLIENT_ID \
+                                  -p $AZURE_CLIENT_SECRET \
                                   --tenant $AZURE_TENANT_ID
+
                                 az account set --subscription $AZURE_SUBSCRIPTION_ID
                             '''
                         }
@@ -117,9 +84,7 @@ pipeline {
                 stage('Build Image') {
                     steps {
                         sh '''
-                            docker build \
-                              -t ${IMAGE_TAG} \
-                              -t ${IMAGE_TAG_RELEASE} .
+                            docker build -t ${IMAGE_TAG} .
                         '''
                     }
                 }
@@ -128,7 +93,6 @@ pipeline {
                     steps {
                         sh '''
                             docker push ${IMAGE_TAG}
-                            docker push ${IMAGE_TAG_RELEASE}
                         '''
                     }
                 }
@@ -142,7 +106,7 @@ pipeline {
                               --overwrite-existing
 
                             kubectl set image deployment/flask-app \
-                              flask-app=${IMAGE_TAG_RELEASE}
+                              flask-app=${IMAGE_TAG}
                         '''
                     }
                 }
