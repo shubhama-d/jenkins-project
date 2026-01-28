@@ -7,8 +7,11 @@ pipeline {
 
     environment {
         PROJECT_DIR      = '06-advanced-project'
-        ACR_NAME         = 'jekinsreg'
-        ACR_LOGIN_SERVER = 'jekinsreg.azurecr.io'
+        
+        // *** UPDATE THIS TO YOUR PRIVATE REGISTRY NAME ***
+        ACR_NAME         = 'jekinsregprivate'
+        ACR_LOGIN_SERVER = "${ACR_NAME}.azurecr.io"
+        
         IMAGE_NAME       = "${ACR_LOGIN_SERVER}/jenkins-flask-app"
         IMAGE_TAG        = "${IMAGE_NAME}:${env.GIT_COMMIT}"
         AKS_CLUSTER      = 'jenkins-demo'
@@ -21,55 +24,41 @@ pipeline {
                 sh '''
                     set -eux
                     cd "$WORKSPACE/${PROJECT_DIR}"
+                    # Install dependencies (ignoring error if already installed)
                     /var/lib/jenkins/.local/bin/poetry install --with dev || true
                 '''
             }
         }
 
-        stage('Azure Network: ALLOW ALL') {
+        stage('Network Verification (Debug)') {
             steps {
-                withCredentials([
-                    usernamePassword(credentialsId: 'azure-sp', usernameVariable: 'AZURE_CLIENT_ID', passwordVariable: 'AZURE_CLIENT_SECRET'),
-                    string(credentialsId: 'azure-tenant-id', variable: 'AZURE_TENANT_ID'),
-                    string(credentialsId: 'azure-subscription-id', variable: 'AZURE_SUBSCRIPTION_ID')
-                ]) {
-                    sh '''
-                        set -eux
-                        
-                        # 1. Login
-                        az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID
-                        az account set --subscription $AZURE_SUBSCRIPTION_ID
-
-                        # 2. FORCE ALLOW ALL NETWORKS
-                        echo "Disabling Firewall (Setting Default Action to Allow)..."
-                        
-                        # Ensure Public Access is Enabled
-                        az acr update --name ${ACR_NAME} --public-network-enabled true
-                        
-                        # Set Default Action to ALLOW (Open to internet)
-                        az acr update --name ${ACR_NAME} --default-action Allow
-                        
-                        # 3. Verify
-                        echo "Verifying settings..."
-                        az acr show --name ${ACR_NAME} --query "{Public:publicNetworkAccess, Action:networkRuleSet.defaultAction}"
-                        
-                        echo "Waiting 30s for changes..."
-                        sleep 30
-                    '''
-                }
+                sh '''
+                    set +x
+                    echo "--- DNS CHECK ---"
+                    # This should confirm we are using the Private IP now
+                    # If this returns a 10.x.x.x address, your Private Endpoint is working!
+                    # If it returns a public IP (e.g. 20.x.x.x), DNS is not synced yet.
+                    
+                    echo "Resolving Registry IP for: ${ACR_LOGIN_SERVER}"
+                    getent hosts ${ACR_LOGIN_SERVER} || echo "Could not resolve host (might need more time)"
+                    echo "-----------------"
+                '''
             }
         }
 
         stage('ACR Login (Docker)') {
             steps {
-                withCredentials([usernamePassword(credentialsId: 'azure-sp', usernameVariable: 'AZURE_CLIENT_ID', passwordVariable: 'AZURE_CLIENT_SECRET')]) {
-                    retry(3) {
-                        sh '''
-                            set -eux
-                            echo "Attempting Docker Login..."
-                            echo $AZURE_CLIENT_SECRET | docker login ${ACR_LOGIN_SERVER} --username $AZURE_CLIENT_ID --password-stdin
-                        '''
-                    }
+                withCredentials([
+                    usernamePassword(credentialsId: 'azure-sp', usernameVariable: 'AZURE_CLIENT_ID', passwordVariable: 'AZURE_CLIENT_SECRET')
+                ]) {
+                    sh '''
+                        set -eux
+                        echo "Attempting Docker Login over Private Link..."
+                        
+                        # No firewall rules needed anymore!
+                        # Traffic flows securely over the VNet Peering.
+                        echo $AZURE_CLIENT_SECRET | docker login ${ACR_LOGIN_SERVER} --username $AZURE_CLIENT_ID --password-stdin
+                    '''
                 }
             }
         }
@@ -87,13 +76,29 @@ pipeline {
 
         stage('Deploy to AKS') {
             steps {
-                sh '''
-                    set -eux
-                    az aks get-credentials --resource-group ${AKS_RG} --name ${AKS_CLUSTER} --overwrite-existing
-                    kubectl apply -f ${PROJECT_DIR}/k8s/deployment.yaml
-                    kubectl set image deployment/flask-app flask-app=${IMAGE_TAG}
-                    kubectl rollout status deployment/flask-app
-                '''
+                withCredentials([
+                    usernamePassword(credentialsId: 'azure-sp', usernameVariable: 'AZURE_CLIENT_ID', passwordVariable: 'AZURE_CLIENT_SECRET'),
+                    string(credentialsId: 'azure-tenant-id', variable: 'AZURE_TENANT_ID'),
+                    string(credentialsId: 'azure-subscription-id', variable: 'AZURE_SUBSCRIPTION_ID')
+                ]) {
+                    sh '''
+                        set -eux
+                        
+                        # Login to Azure CLI (Required for getting AKS credentials)
+                        az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID
+                        az account set --subscription $AZURE_SUBSCRIPTION_ID
+                        
+                        # Get Kubeconfig
+                        az aks get-credentials --resource-group ${AKS_RG} --name ${AKS_CLUSTER} --overwrite-existing
+                        
+                        # Deploy
+                        kubectl apply -f ${PROJECT_DIR}/k8s/deployment.yaml
+                        kubectl set image deployment/flask-app flask-app=${IMAGE_TAG}
+                        
+                        # Wait for rollout
+                        kubectl rollout status deployment/flask-app
+                    '''
+                }
             }
         }
     }
