@@ -6,13 +6,13 @@ pipeline {
     }
 
     environment {
-        PROJECT_DIR = '06-advanced-project'
+        PROJECT_DIR      = '06-advanced-project'
         ACR_NAME         = 'jekinsreg'
         ACR_LOGIN_SERVER = 'jekinsreg.azurecr.io'
         IMAGE_NAME       = "${ACR_LOGIN_SERVER}/jenkins-flask-app"
         IMAGE_TAG        = "${IMAGE_NAME}:${env.GIT_COMMIT}"
-        AKS_CLUSTER = 'jenkins-demo'
-        AKS_RG      = 'shub-poc-rg'
+        AKS_CLUSTER      = 'jenkins-demo'
+        AKS_RG           = 'shub-poc-rg'
     }
 
     stages {
@@ -21,13 +21,12 @@ pipeline {
                 sh '''
                     set -eux
                     cd "$WORKSPACE/${PROJECT_DIR}"
-                    /var/lib/jenkins/.local/bin/poetry --version || true
                     /var/lib/jenkins/.local/bin/poetry install --with dev || true
                 '''
             }
         }
 
-        stage('Azure Login & Force Network Fix') {
+        stage('Azure Network Repair & Verify') {
             steps {
                 withCredentials([
                     usernamePassword(credentialsId: 'azure-sp', usernameVariable: 'AZURE_CLIENT_ID', passwordVariable: 'AZURE_CLIENT_SECRET'),
@@ -44,38 +43,36 @@ pipeline {
                         # 2. Get Agent IP
                         AGENT_IP=$(curl -s https://api.ipify.org)
                         echo "Detected Agent IP: $AGENT_IP"
+                        echo $AGENT_IP > agent_ip.txt
 
-                        # 3. DEBUG & FIX REGISTRY
-                        echo "Inspecting Registry Configuration..."
+                        # 3. FORCE CONFIGURATION (The "Double Gate" Fix)
+                        echo "--- FORCING NETWORK CONFIGURATION ---"
+                        
+                        # GATE 1: Force Public Access Enabled (Must be true for whitelist to work)
+                        az acr update --name ${ACR_NAME} --public-network-enabled true
+                        
+                        # GATE 2: Force Default Action to Deny (Must be Deny for whitelist to work)
+                        az acr update --name ${ACR_NAME} --default-action Deny
+                        
+                        # 4. ADD IP RULE
+                        echo "Adding IP Rule..."
+                        az acr network-rule add --name ${ACR_NAME} --ip-address "${AGENT_IP}" || echo "Rule likely exists"
+
+                        # 5. VERIFICATION (The "Truth" Step)
+                        echo "--- VERIFYING ACTUAL STATE ---"
                         JSON_CONFIG=$(az acr show --name ${ACR_NAME} --output json)
-                        SKU=$(echo $JSON_CONFIG | jq -r .sku.name)
-                        PUBLIC_ACCESS=$(echo $JSON_CONFIG | jq -r .publicNetworkAccess)
-                        echo "Current SKU: $SKU"
-                        echo "Public Access Enabled: $PUBLIC_ACCESS"
+                        
+                        IS_PUBLIC=$(echo $JSON_CONFIG | jq -r .publicNetworkAccess)
+                        DEFAULT_ACTION=$(echo $JSON_CONFIG | jq -r .networkRuleSet.defaultAction)
+                        
+                        echo "Public Access: $IS_PUBLIC (Should be 'Enabled')"
+                        echo "Default Action: $DEFAULT_ACTION (Should be 'Deny')"
+                        
+                        echo "--- LISTING ALL ALLOWED IPs ---"
+                        # This prints exactly what Azure is allowing. If your IP isn't here, the command failed.
+                        az acr network-rule list --name ${ACR_NAME} --output table
 
-                        # FIX 1: Ensure Public Network Access is Enabled (Prerequisite for ANY internet access)
-                        if [ "$PUBLIC_ACCESS" == "Disabled" ]; then
-                            echo "CRITICAL: Public access was Disabled. Enabling it now..."
-                            az acr update --name ${ACR_NAME} --public-network-enabled true
-                            sleep 30 # Wait for setting to apply
-                        fi
-
-                        # FIX 2: Handle Firewall based on SKU
-                        if [ "$SKU" == "Premium" ]; then
-                            echo "Premium SKU detected. Configuring Firewall..."
-                            # Ensure we are in 'Selected Networks' mode (Deny by default)
-                            az acr update --name ${ACR_NAME} --default-action Deny
-                            
-                            # Add the specific rule
-                            az acr network-rule add --name ${ACR_NAME} --ip-address "${AGENT_IP}" || echo "IP rule likely exists"
-                        else
-                            echo "SKU is $SKU (Not Premium). Firewall rules NOT supported."
-                            echo "Forcing 'Allow All' networks so build can succeed..."
-                            # On Basic/Standard, we MUST allow all traffic if we want public internet access
-                            az acr update --name ${ACR_NAME} --default-action Allow
-                        fi
-
-                        echo "Waiting 60s for Azure network propagation..."
+                        echo "Waiting 60s for propagation..."
                         sleep 60
                     '''
                 }
@@ -115,6 +112,21 @@ pipeline {
                     kubectl apply -f ${PROJECT_DIR}/k8s/deployment.yaml
                     kubectl set image deployment/flask-app flask-app=${IMAGE_TAG}
                     kubectl rollout status deployment/flask-app
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            withCredentials([usernamePassword(credentialsId: 'azure-sp', usernameVariable: 'AZURE_CLIENT_ID', passwordVariable: 'AZURE_CLIENT_SECRET'), string(credentialsId: 'azure-tenant-id', variable: 'AZURE_TENANT_ID')]) {
+                sh '''
+                    if [ -f agent_ip.txt ]; then
+                        AGENT_IP=$(cat agent_ip.txt)
+                        az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID > /dev/null
+                        echo "Cleaning up IP $AGENT_IP..."
+                        az acr network-rule remove --name ${ACR_NAME} --ip-address "${AGENT_IP}" || true
+                    fi
                 '''
             }
         }
