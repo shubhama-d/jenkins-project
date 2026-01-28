@@ -3,14 +3,14 @@ pipeline {
 
     environment {
         // Azure / ACR
-        ACR_NAME        = 'myacrname'
-        ACR_LOGIN_SERVER = 'myacrname.azurecr.io'
+        ACR_NAME        = 'jekinsreg'
+        ACR_LOGIN_SERVER = 'jekinsreg.azurecr.io'
         IMAGE_NAME      = "${ACR_LOGIN_SERVER}/jenkins-flask-app"
         IMAGE_TAG       = "${IMAGE_NAME}:${env.GIT_COMMIT}"
 
         // AKS
-        AKS_CLUSTER     = 'my-aks-cluster'
-        AKS_RG          = 'my-aks-resource-group'
+        AKS_CLUSTER     = 'jenkins-demo'
+        AKS_RG          = 'shub-poc-rg'
 
         // GitHub
         GH_TOKEN = credentials('github-access-token')
@@ -32,10 +32,13 @@ pipeline {
         stage('Setup') {
             steps {
                 sh '''
-                    set -eux
-                    cd "$WORKSPACE/06-advanced-project"
-                    /var/lib/jenkins/.local/bin/poetry install --with dev
-                '''
+                   set -eux
+
+                   cd "$WORKSPACE/06-advanced-project"
+
+                   /var/lib/jenkins/.local/bin/poetry --version
+                   /var/lib/jenkins/.local/bin/poetry install --with dev
+        '''
             }
         }
 
