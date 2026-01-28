@@ -15,6 +15,6 @@ spec:
       containers:
         - name: flask-app
           # Placeholder image – Jenkins will override this
-          image: jekinsreg.azurecr.io/jenkins-flask-app:latest
+          image: jekinsregprivate.azurecr.io/jenkins-flask-app:latest
           ports:
             - containerPort: 5000
