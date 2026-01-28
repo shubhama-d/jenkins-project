@@ -49,17 +49,18 @@ pipeline {
             steps {
                 sh '''
                    set -eux
-                   cd "$WORKSPACE"
+
+   
+                   cd "$WORKSPACE/06-advanced-project"
+
 
                    /var/lib/jenkins/.local/bin/poetry run semantic-release \
                    version \
-                   --repository-dir "$WORKSPACE" \
-                   --config "$WORKSPACE/06-advanced-project/pyproject.toml"
+                   --repository-dir "$WORKSPACE"
 
-                   /var/lib/jenkins/.local/bin/poetry run semantic-release \
-                   publish \
-                   --repository-dir "$WORKSPACE" \
-                   --config "$WORKSPACE/06-advanced-project/pyproject.toml"
+                  /var/lib/jenkins/.local/bin/poetry run semantic-release \
+                  publish \
+                  --repository-dir "$WORKSPACE"
         '''
             }
         }
