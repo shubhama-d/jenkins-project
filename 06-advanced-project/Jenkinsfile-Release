@@ -18,32 +18,20 @@ pipeline {
         // AKS
         AKS_CLUSTER = 'jenkins-demo'
         AKS_RG      = 'shub-poc-rg'
-
-        // GitHub token (REQUIRED for semantic-release)
-        GH_TOKEN = credentials('github-access-token')
     }
 
     stages {
 
-        stage('Detect Git Tag') {
+        stage('Debug / Environment') {
             steps {
-                script {
-                    env.GIT_TAG = sh(
-                        returnStdout: true,
-                        script: "git describe --tags --exact-match || true"
-                    ).trim()
-
-                    if (env.GIT_TAG) {
-                        env.IMAGE_TAG_RELEASE = "${IMAGE_NAME}:${env.GIT_TAG}"
-                        echo "Tag build detected: ${env.GIT_TAG}"
-                    } else {
-                        echo "No tag detected – normal build"
-                    }
-                }
+                sh '''
+                    printenv
+                    ls -la
+                '''
             }
         }
 
-        stage('Setup Poetry') {
+        stage('Setup Dependencies') {
             steps {
                 sh '''
                     set -eux
@@ -55,104 +43,91 @@ pipeline {
             }
         }
 
-        stage('Fix Git Checkout (semantic-release)') {
-            steps {
-                sh '''
-                    set -eux
-
-                    git fetch --all --tags
-                    git checkout -B main origin/main
-
-                    git config --global user.email "jenkins@ci.local"
-                    git config --global user.name "jenkins-bot"
-                    git remote set-url origin https://${GH_TOKEN}@github.com/shubhama-d/jenkins-project.git
-                '''
-            }
-        }
-
-        stage('Create Release') {
-            when {
-                expression { env.GIT_TAG == "" }
-            }
+        stage('Run Tests') {
             steps {
                 sh '''
                     set -eux
                     cd "$WORKSPACE/${PROJECT_DIR}"
 
-                    /var/lib/jenkins/.local/bin/poetry run semantic-release version
-                    /var/lib/jenkins/.local/bin/poetry run semantic-release publish
+                    /var/lib/jenkins/.local/bin/poetry run pytest
                 '''
             }
         }
 
-        stage('Build & Deploy (Tag Only)') {
-            when {
-                expression { env.GIT_TAG != "" }
+        stage('Azure Login') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'azure-sp',
+                        usernameVariable: 'AZURE_CLIENT_ID',
+                        passwordVariable: 'AZURE_CLIENT_SECRET'
+                    ),
+                    string(credentialsId: 'azure-tenant-id', variable: 'AZURE_TENANT_ID'),
+                    string(credentialsId: 'azure-subscription-id', variable: 'AZURE_SUBSCRIPTION_ID')
+                ]) {
+                    sh '''
+                        set -eux
+                        az login --service-principal \
+                          --username $AZURE_CLIENT_ID \
+                          --password $AZURE_CLIENT_SECRET \
+                          --tenant $AZURE_TENANT_ID
+
+                        az account set --subscription $AZURE_SUBSCRIPTION_ID
+                    '''
+                }
             }
+        }
 
-            stages {
+        stage('ACR Login') {
+            steps {
+                sh '''
+                    set -eux
+                    az acr login --name ${ACR_NAME}
+                '''
+            }
+        }
 
-                stage('Azure Login') {
-                    steps {
-                        withCredentials([
-                            usernamePassword(
-                                credentialsId: 'azure-sp',
-                                usernameVariable: 'AZURE_CLIENT_ID',
-                                passwordVariable: 'AZURE_CLIENT_SECRET'
-                            ),
-                            string(credentialsId: 'azure-tenant-id', variable: 'AZURE_TENANT_ID'),
-                            string(credentialsId: 'azure-subscription-id', variable: 'AZURE_SUBSCRIPTION_ID')
-                        ]) {
-                            sh '''
-                                az login --service-principal \
-                                  --username $AZURE_CLIENT_ID \
-                                  --password $AZURE_CLIENT_SECRET \
-                                  --tenant $AZURE_TENANT_ID
+        stage('Build Docker Image') {
+            steps {
+                sh '''
+                    set -eux
+                    cd "$WORKSPACE/${PROJECT_DIR}"
 
-                                az account set --subscription $AZURE_SUBSCRIPTION_ID
-                            '''
-                        }
-                    }
-                }
+                    docker build -t ${IMAGE_TAG} .
+                    docker image ls | head -20
+                '''
+            }
+        }
 
-                stage('ACR Login') {
-                    steps {
-                        sh 'az acr login --name ${ACR_NAME}'
-                    }
-                }
+        stage('Push Image to ACR') {
+            steps {
+                sh '''
+                    set -eux
+                    docker push ${IMAGE_TAG}
+                '''
+            }
+        }
 
-                stage('Build Image') {
-                    steps {
-                        sh '''
-                            docker build \
-                              -t ${IMAGE_TAG} \
-                              -t ${IMAGE_TAG_RELEASE} .
-                        '''
-                    }
-                }
+        stage('Deploy to AKS') {
+            steps {
+                sh '''
+                    set -eux
 
-                stage('Push Image') {
-                    steps {
-                        sh '''
-                            docker push ${IMAGE_TAG}
-                            docker push ${IMAGE_TAG_RELEASE}
-                        '''
-                    }
-                }
+                    az aks get-credentials \
+                      --resource-group ${AKS_RG} \
+                      --name ${AKS_CLUSTER} \
+                      --overwrite-existing
 
-                stage('Deploy to AKS') {
-                    steps {
-                        sh '''
-                            az aks get-credentials \
-                              --resource-group ${AKS_RG} \
-                              --name ${AKS_CLUSTER} \
-                              --overwrite-existing
+                    # Ensure deployment exists
+                    kubectl apply -f ${PROJECT_DIR}/k8s/deployment.yaml
 
-                            kubectl set image deployment/flask-app \
-                              flask-app=${IMAGE_TAG_RELEASE}
-                        '''
-                    }
-                }
+                    # Update deployment with new image
+                    kubectl set image deployment/flask-app \
+                      flask-app=${IMAGE_TAG}
+
+                    # Verify rollout
+                    kubectl rollout status deployment/flask-app
+                '''
             }
         }
     }
