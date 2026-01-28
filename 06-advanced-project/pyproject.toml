@@ -32,5 +32,6 @@ allow_zero_version = true
 tag_format = "v{version}"
 remote.type = "github"
 remote.token.env = "GH_TOKEN_PSW"
+repo_dir = ".."
 
 
