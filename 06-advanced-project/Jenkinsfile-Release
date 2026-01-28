@@ -79,14 +79,17 @@ pipeline {
                         # 2. Get Agent Public IP
                         AGENT_IP=$(curl -s https://api.ipify.org)
                         echo "Detected Agent IP: $AGENT_IP"
+                        echo $AGENT_IP > agent_ip.txt
                         
                         # 3. Add IP to ACR Firewall
-                        # "|| true" added here: If IP already exists, command fails but script continues.
+                        # "|| echo" prevents failure if IP exists, but we verify it's there
                         echo "Whitelisting IP on ACR..."
-                        az acr network-rule add --name ${ACR_NAME} --ip-address $AGENT_IP || echo "IP $AGENT_IP likely already whitelisted, proceeding..."
+                        az acr network-rule add --name ${ACR_NAME} --ip-address $AGENT_IP || echo "IP already allowed or error ignorable"
                         
-                        # Save IP to a file so we can remove it in the 'post' block
-                        echo $AGENT_IP > agent_ip.txt
+                        # 4. CRITICAL: Wait for propagation
+                        # Azure firewall rules take time to apply. We wait 60 seconds to be safe.
+                        echo "Waiting 60s for firewall rule to propagate..."
+                        sleep 60
                     '''
                 }
             }
@@ -101,13 +104,18 @@ pipeline {
                         passwordVariable: 'AZURE_CLIENT_SECRET'
                     )
                 ]) {
-                    sh '''
-                        set -eux
-                        # Standard docker login with SP credentials
-                        echo $AZURE_CLIENT_SECRET | docker login ${ACR_LOGIN_SERVER} \
-                            --username $AZURE_CLIENT_ID \
-                            --password-stdin
-                    '''
+                    // Retry block: If login fails (due to propagation delay), retry up to 3 times
+                    retry(3) {
+                        sh '''
+                            set -eux
+                            echo "Attempting Docker Login..."
+                            
+                            # Standard docker login
+                            echo $AZURE_CLIENT_SECRET | docker login ${ACR_LOGIN_SERVER} \
+                                --username $AZURE_CLIENT_ID \
+                                --password-stdin
+                        '''
+                    }
                 }
             }
         }
@@ -172,12 +180,10 @@ pipeline {
                 sh '''
                     if [ -f agent_ip.txt ]; then
                         AGENT_IP=$(cat agent_ip.txt)
-                        echo "Removing IP $AGENT_IP from ACR firewall..."
+                        echo "Cleaning up: Removing IP $AGENT_IP from ACR firewall..."
                         
-                        # Re-login required in post block in some environments
                         az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID > /dev/null
                         
-                        # "|| true" ensures build doesn't fail if IP was already removed
                         az acr network-rule remove --name ${ACR_NAME} --ip-address $AGENT_IP || true
                     fi
                 '''
