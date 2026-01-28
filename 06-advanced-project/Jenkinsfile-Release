@@ -26,7 +26,7 @@ pipeline {
             }
         }
 
-        stage('Azure Network Repair & Verify') {
+        stage('Azure Network: ALLOW ALL') {
             steps {
                 withCredentials([
                     usernamePassword(credentialsId: 'azure-sp', usernameVariable: 'AZURE_CLIENT_ID', passwordVariable: 'AZURE_CLIENT_SECRET'),
@@ -40,40 +40,21 @@ pipeline {
                         az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID
                         az account set --subscription $AZURE_SUBSCRIPTION_ID
 
-                        # 2. Get Agent IP
-                        AGENT_IP=$(curl -s https://api.ipify.org)
-                        echo "Detected Agent IP: $AGENT_IP"
-                        echo $AGENT_IP > agent_ip.txt
-
-                        # 3. FORCE CONFIGURATION (The "Double Gate" Fix)
-                        echo "--- FORCING NETWORK CONFIGURATION ---"
+                        # 2. FORCE ALLOW ALL NETWORKS
+                        echo "Disabling Firewall (Setting Default Action to Allow)..."
                         
-                        # GATE 1: Force Public Access Enabled (Must be true for whitelist to work)
+                        # Ensure Public Access is Enabled
                         az acr update --name ${ACR_NAME} --public-network-enabled true
                         
-                        # GATE 2: Force Default Action to Deny (Must be Deny for whitelist to work)
-                        az acr update --name ${ACR_NAME} --default-action Deny
+                        # Set Default Action to ALLOW (Open to internet)
+                        az acr update --name ${ACR_NAME} --default-action Allow
                         
-                        # 4. ADD IP RULE
-                        echo "Adding IP Rule..."
-                        az acr network-rule add --name ${ACR_NAME} --ip-address "${AGENT_IP}" || echo "Rule likely exists"
-
-                        # 5. VERIFICATION (The "Truth" Step)
-                        echo "--- VERIFYING ACTUAL STATE ---"
-                        JSON_CONFIG=$(az acr show --name ${ACR_NAME} --output json)
+                        # 3. Verify
+                        echo "Verifying settings..."
+                        az acr show --name ${ACR_NAME} --query "{Public:publicNetworkAccess, Action:networkRuleSet.defaultAction}"
                         
-                        IS_PUBLIC=$(echo $JSON_CONFIG | jq -r .publicNetworkAccess)
-                        DEFAULT_ACTION=$(echo $JSON_CONFIG | jq -r .networkRuleSet.defaultAction)
-                        
-                        echo "Public Access: $IS_PUBLIC (Should be 'Enabled')"
-                        echo "Default Action: $DEFAULT_ACTION (Should be 'Deny')"
-                        
-                        echo "--- LISTING ALL ALLOWED IPs ---"
-                        # This prints exactly what Azure is allowing. If your IP isn't here, the command failed.
-                        az acr network-rule list --name ${ACR_NAME} --output table
-
-                        echo "Waiting 60s for propagation..."
-                        sleep 60
+                        echo "Waiting 30s for changes..."
+                        sleep 30
                     '''
                 }
             }
@@ -112,21 +93,6 @@ pipeline {
                     kubectl apply -f ${PROJECT_DIR}/k8s/deployment.yaml
                     kubectl set image deployment/flask-app flask-app=${IMAGE_TAG}
                     kubectl rollout status deployment/flask-app
-                '''
-            }
-        }
-    }
-
-    post {
-        always {
-            withCredentials([usernamePassword(credentialsId: 'azure-sp', usernameVariable: 'AZURE_CLIENT_ID', passwordVariable: 'AZURE_CLIENT_SECRET'), string(credentialsId: 'azure-tenant-id', variable: 'AZURE_TENANT_ID')]) {
-                sh '''
-                    if [ -f agent_ip.txt ]; then
-                        AGENT_IP=$(cat agent_ip.txt)
-                        az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID > /dev/null
-                        echo "Cleaning up IP $AGENT_IP..."
-                        az acr network-rule remove --name ${ACR_NAME} --ip-address "${AGENT_IP}" || true
-                    fi
                 '''
             }
         }
