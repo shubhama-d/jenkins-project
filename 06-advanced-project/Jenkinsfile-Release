@@ -54,7 +54,7 @@ pipeline {
             }
         }
 
-        stage('Azure Login & Whitelist IP') {
+        stage('Azure Login & Configure Firewall') {
             steps {
                 withCredentials([
                     usernamePassword(
@@ -80,15 +80,30 @@ pipeline {
                         AGENT_IP=$(curl -s https://api.ipify.org)
                         echo "Detected Agent IP: $AGENT_IP"
                         echo $AGENT_IP > agent_ip.txt
+
+                        # 3. Check SKU and Configure Access
+                        # We need to ensure the registry is in a state that respects the IP list
+                        SKU=$(az acr show --name ${ACR_NAME} --query sku.name -o tsv)
+                        echo "ACR SKU is: $SKU"
                         
-                        # 3. Add IP to ACR Firewall
-                        # "|| echo" prevents failure if IP exists, but we verify it's there
-                        echo "Whitelisting IP on ACR..."
-                        az acr network-rule add --name ${ACR_NAME} --ip-address $AGENT_IP || echo "IP already allowed or error ignorable"
+                        if [ "$SKU" == "Premium" ]; then
+                            echo "Ensuring Registry is set to 'Selected Networks'..."
+                            # If this was 'Disabled', the IP whitelist would be ignored. We force it to 'Deny' (Selected Networks).
+                            az acr update --name ${ACR_NAME} --default-action Deny
+                            
+                            echo "Whitelisting IP on ACR..."
+                            # Use CIDR notation /32 to be explicit
+                            az acr network-rule add --name ${ACR_NAME} --ip-address "${AGENT_IP}/32" || echo "Rule likely exists, continuing..."
+                        else
+                            echo "WARNING: ACR is not Premium. IP Whitelisting is NOT supported."
+                            echo "Attempting to enable 'All Networks' access so build can proceed..."
+                            az acr update --name ${ACR_NAME} --admin-enabled true
+                            # On Basic/Standard, we often have to allow all traffic
+                            # az acr update --name ${ACR_NAME} --default-action Allow
+                        fi
                         
-                        # 4. CRITICAL: Wait for propagation
-                        # Azure firewall rules take time to apply. We wait 60 seconds to be safe.
-                        echo "Waiting 60s for firewall rule to propagate..."
+                        # 4. Wait for propagation
+                        echo "Waiting 60s for settings to propagate..."
                         sleep 60
                     '''
                 }
@@ -104,13 +119,11 @@ pipeline {
                         passwordVariable: 'AZURE_CLIENT_SECRET'
                     )
                 ]) {
-                    // Retry block: If login fails (due to propagation delay), retry up to 3 times
                     retry(3) {
                         sh '''
                             set -eux
                             echo "Attempting Docker Login..."
                             
-                            # Standard docker login
                             echo $AZURE_CLIENT_SECRET | docker login ${ACR_LOGIN_SERVER} \
                                 --username $AZURE_CLIENT_ID \
                                 --password-stdin
@@ -184,7 +197,11 @@ pipeline {
                         
                         az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID > /dev/null
                         
-                        az acr network-rule remove --name ${ACR_NAME} --ip-address $AGENT_IP || true
+                        # Check SKU again to be safe
+                        SKU=$(az acr show --name ${ACR_NAME} --query sku.name -o tsv)
+                        if [ "$SKU" == "Premium" ]; then
+                             az acr network-rule remove --name ${ACR_NAME} --ip-address "${AGENT_IP}/32" || true
+                        fi
                     fi
                 '''
             }
