@@ -2,15 +2,19 @@ pipeline {
     agent any
 
     environment {
-        IMAGE_NAME = 'sanjeevkt720/jenkins-flask-app'
-        IMAGE_TAG = "${IMAGE_NAME}:${env.GIT_COMMIT}"
-        KUBECONFIG = credentials('kubeconfig-credentials-id')
-        AWS_ACCESS_KEY_ID = credentials('aws-access-key')
-        AWS_SECRET_ACCESS_KEY = credentials('aws-secret-key')
+        // Azure / ACR
+        ACR_NAME        = 'myacrname'
+        ACR_LOGIN_SERVER = 'myacrname.azurecr.io'
+        IMAGE_NAME      = "${ACR_LOGIN_SERVER}/jenkins-flask-app"
+        IMAGE_TAG       = "${IMAGE_NAME}:${env.GIT_COMMIT}"
+
+        // AKS
+        AKS_CLUSTER     = 'my-aks-cluster'
+        AKS_RG          = 'my-aks-resource-group'
+
+        // GitHub
         GH_TOKEN = credentials('github-access-token')
     }
-
-
 
     stages {
 
@@ -18,89 +22,103 @@ pipeline {
             steps {
                 script {
                     def tag = sh(returnStdout: true, script: "git tag --contains").trim()
-
-                    if (tag != null) {
-                        env.GIT_TAG = tag
-                    } else {
-                        env.GIT_TAG = ''
-                    }
-                    echo "GIT_TAG is set to: ${env.GIT_TAG}"
-                    env.IMAGE_TAG_RELEASE = "${IMAGE_NAME}:${GIT_TAG}"
+                    env.GIT_TAG = tag ?: ""
+                    env.IMAGE_TAG_RELEASE = "${IMAGE_NAME}:${env.GIT_TAG}"
+                    echo "GIT_TAG: ${env.GIT_TAG}"
                 }
             }
         }
 
         stage('Setup') {
             steps {
-                script {
-                    sh "poetry install --with dev"
-                }
+                sh '''
+                    set -eux
+                    cd "$WORKSPACE/06-advanced-project"
+                    /var/lib/jenkins/.local/bin/poetry install --with dev
+                '''
             }
         }
 
         stage('Create Release') {
             when {
-                expression {
-                    return env.GIT_TAG == "" // Only run if GIT_TAG is not set
-                }
+                expression { env.GIT_TAG == "" }
             }
             steps {
-                script {
-                    
-                    sh 'printenv'
-                    def tag = sh(returnStdout: true, script: "poetry run semantic-release version").trim()
-                    echo "${tag}"
-
-                    sh "poetry run semantic-release publish"
-
-
-                    echo "Published new tag: ${tag}"
-                }
+                sh '''
+                    set -eux
+                    cd "$WORKSPACE/06-advanced-project"
+                    tag=$(/var/lib/jenkins/.local/bin/poetry run semantic-release version)
+                    /var/lib/jenkins/.local/bin/poetry run semantic-release publish
+                    echo "Published new tag: $tag"
+                '''
             }
         }
 
-
         stage("Build and Deploy") {
             when {
-                expression {
-                    return env.GIT_TAG != "" // Only run if GIT_TAG is not empty
-                }
+                expression { env.GIT_TAG != "" }
             }
 
             stages {
 
-                stage('Docker Login') {
+                stage('Azure Login') {
                     steps {
-                        withCredentials([usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
-                        sh 'echo ${PASSWORD} | docker login -u ${USERNAME} --password-stdin'}
-                        echo 'Login successfully'
+                        withCredentials([
+                            usernamePassword(credentialsId: 'azure-sp', usernameVariable: 'AZURE_CLIENT_ID', passwordVariable: 'AZURE_CLIENT_SECRET'),
+                            string(credentialsId: 'azure-tenant-id', variable: 'AZURE_TENANT_ID'),
+                            string(credentialsId: 'azure-subscription-id', variable: 'AZURE_SUBSCRIPTION_ID')
+                        ]) {
+                            sh '''
+                                az login --service-principal \
+                                  --username $AZURE_CLIENT_ID \
+                                  --password $AZURE_CLIENT_SECRET \
+                                  --tenant $AZURE_TENANT_ID
+
+                                az account set --subscription $AZURE_SUBSCRIPTION_ID
+                            '''
+                        }
                     }
                 }
-                stage('Build') {
+
+                stage('ACR Login') {
                     steps {
-                        sh 'docker build -t ${IMAGE_TAG} -t ${IMAGE_TAG_RELEASE} .'
-                        echo "Docker image build successfully"
-                        sh 'docker image ls'
+                        sh 'az acr login --name ${ACR_NAME}'
+                    }
+                }
+
+                stage('Build Image') {
+                    steps {
+                        sh '''
+                            docker build \
+                              -t ${IMAGE_TAG} \
+                              -t ${IMAGE_TAG_RELEASE} .
+                        '''
                     }
                 }
 
                 stage('Push Image') {
                     steps {
-                        sh 'docker push --all-tags ${IMAGE_NAME}'
-                        echo "Docker image push successfully"
+                        sh '''
+                            docker push ${IMAGE_TAG}
+                            docker push ${IMAGE_TAG_RELEASE}
+                        '''
                     }
                 }
 
-                stage('Deploy') {
+                stage('Deploy to AKS') {
                     steps {
-                        sh 'kubectl config use-context user@prod.us-east-1.eksctl.io'
-                        sh 'kubectl config current-context'
-                        sh "kubectl set image deployment/flask-app flask-app=${IMAGE_TAG_RELEASE}"
+                        sh '''
+                            az aks get-credentials \
+                              --resource-group ${AKS_RG} \
+                              --name ${AKS_CLUSTER} \
+                              --overwrite-existing
+
+                            kubectl set image deployment/flask-app \
+                              flask-app=${IMAGE_TAG_RELEASE}
+                        '''
                     }
                 }
             }
         }
-
     }
-
 }
