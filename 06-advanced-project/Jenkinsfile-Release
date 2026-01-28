@@ -7,15 +7,14 @@ pipeline {
 
     environment {
         PROJECT_DIR      = '06-advanced-project'
-        
-        // Ensure this matches your Private Registry
         ACR_NAME         = 'jekinsregprivate'
         ACR_LOGIN_SERVER = "${ACR_NAME}.azurecr.io"
-        
         IMAGE_NAME       = "${ACR_LOGIN_SERVER}/jenkins-flask-app"
         IMAGE_TAG        = "${IMAGE_NAME}:${env.GIT_COMMIT}"
         AKS_CLUSTER      = 'jenkins-demo'
         AKS_RG           = 'shub-poc-rg'
+        // Hardcoded version to prevent network timeouts/errors
+        KUBECTL_VERSION  = 'v1.29.0' 
     }
 
     stages {
@@ -37,7 +36,6 @@ pipeline {
                     sh '''
                         set -eux
                         echo "Attempting Docker Login..."
-                        # Using the Service Principal to auth with the Private Registry
                         echo $AZURE_CLIENT_SECRET | docker login ${ACR_LOGIN_SERVER} --username $AZURE_CLIENT_ID --password-stdin
                     '''
                 }
@@ -69,39 +67,32 @@ pipeline {
                         az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID
                         az account set --subscription $AZURE_SUBSCRIPTION_ID
                         
-                        # --- 2. INSTALL KUBECTL (The Fix) ---
-                        # We install it locally in the workspace to avoid permission issues
+                        # --- 2. INSTALL KUBECTL (Robust Method) ---
+                        # We use a specific version to avoid 'Timed out' errors on dynamic checks
                         if ! command -v kubectl &> /dev/null; then
-                            echo "kubectl not found. Installing locally..."
+                            echo "kubectl not found. Installing version $KUBECTL_VERSION locally..."
                             
-                            # Create a local bin directory
                             mkdir -p $WORKSPACE/bin
                             
-                            # Download the latest stable kubectl
-                            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+                            # Download specific version directly (No sub-shell curl calls)
+                            curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
                             
-                            # Make it executable and move it
                             chmod +x kubectl
                             mv kubectl $WORKSPACE/bin/
-                            
-                            # Add to PATH for this script session
                             export PATH=$WORKSPACE/bin:$PATH
                         else
                             echo "kubectl is already installed."
                         fi
 
-                        # Verify version
+                        # Verify
                         kubectl version --client
 
-                        # --- 3. CONFIGURE AKS CONTEXT ---
+                        # --- 3. CONFIGURE AKS ---
                         az aks get-credentials --resource-group ${AKS_RG} --name ${AKS_CLUSTER} --overwrite-existing
                         
                         # --- 4. DEPLOY ---
-                        # Note: We use the full path just in case PATH variable acts up
                         kubectl apply -f ${PROJECT_DIR}/k8s/deployment.yaml
                         kubectl set image deployment/flask-app flask-app=${IMAGE_TAG}
-                        
-                        # --- 5. VERIFY ---
                         kubectl rollout status deployment/flask-app
                     '''
                 }
