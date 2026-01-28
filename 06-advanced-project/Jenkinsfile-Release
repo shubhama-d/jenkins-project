@@ -42,6 +42,24 @@ pipeline {
             }
         }
 
+         stage('Fix Git Checkout') {
+             steps {
+                sh '''
+                   set -eux
+
+                   # Ensure we are on main branch
+                   git fetch --all --tags
+                   git checkout main
+                   git pull origin main
+
+                   # Verify
+                   git branch --show-current
+                   git describe --tags --always
+        '''
+    }
+}
+
+
         stage('Create Release') {
             when {
                 expression { env.GIT_TAG == "" }
