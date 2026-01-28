@@ -8,7 +8,7 @@ pipeline {
     environment {
         PROJECT_DIR      = '06-advanced-project'
         
-        // *** UPDATE THIS TO YOUR PRIVATE REGISTRY NAME ***
+        // Ensure this matches your Private Registry
         ACR_NAME         = 'jekinsregprivate'
         ACR_LOGIN_SERVER = "${ACR_NAME}.azurecr.io"
         
@@ -24,24 +24,7 @@ pipeline {
                 sh '''
                     set -eux
                     cd "$WORKSPACE/${PROJECT_DIR}"
-                    # Install dependencies (ignoring error if already installed)
                     /var/lib/jenkins/.local/bin/poetry install --with dev || true
-                '''
-            }
-        }
-
-        stage('Network Verification (Debug)') {
-            steps {
-                sh '''
-                    set +x
-                    echo "--- DNS CHECK ---"
-                    # This should confirm we are using the Private IP now
-                    # If this returns a 10.x.x.x address, your Private Endpoint is working!
-                    # If it returns a public IP (e.g. 20.x.x.x), DNS is not synced yet.
-                    
-                    echo "Resolving Registry IP for: ${ACR_LOGIN_SERVER}"
-                    getent hosts ${ACR_LOGIN_SERVER} || echo "Could not resolve host (might need more time)"
-                    echo "-----------------"
                 '''
             }
         }
@@ -53,10 +36,8 @@ pipeline {
                 ]) {
                     sh '''
                         set -eux
-                        echo "Attempting Docker Login over Private Link..."
-                        
-                        # No firewall rules needed anymore!
-                        # Traffic flows securely over the VNet Peering.
+                        echo "Attempting Docker Login..."
+                        # Using the Service Principal to auth with the Private Registry
                         echo $AZURE_CLIENT_SECRET | docker login ${ACR_LOGIN_SERVER} --username $AZURE_CLIENT_ID --password-stdin
                     '''
                 }
@@ -84,18 +65,43 @@ pipeline {
                     sh '''
                         set -eux
                         
-                        # Login to Azure CLI (Required for getting AKS credentials)
+                        # --- 1. LOGIN TO AZURE ---
                         az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID
                         az account set --subscription $AZURE_SUBSCRIPTION_ID
                         
-                        # Get Kubeconfig
+                        # --- 2. INSTALL KUBECTL (The Fix) ---
+                        # We install it locally in the workspace to avoid permission issues
+                        if ! command -v kubectl &> /dev/null; then
+                            echo "kubectl not found. Installing locally..."
+                            
+                            # Create a local bin directory
+                            mkdir -p $WORKSPACE/bin
+                            
+                            # Download the latest stable kubectl
+                            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+                            
+                            # Make it executable and move it
+                            chmod +x kubectl
+                            mv kubectl $WORKSPACE/bin/
+                            
+                            # Add to PATH for this script session
+                            export PATH=$WORKSPACE/bin:$PATH
+                        else
+                            echo "kubectl is already installed."
+                        fi
+
+                        # Verify version
+                        kubectl version --client
+
+                        # --- 3. CONFIGURE AKS CONTEXT ---
                         az aks get-credentials --resource-group ${AKS_RG} --name ${AKS_CLUSTER} --overwrite-existing
                         
-                        # Deploy
+                        # --- 4. DEPLOY ---
+                        # Note: We use the full path just in case PATH variable acts up
                         kubectl apply -f ${PROJECT_DIR}/k8s/deployment.yaml
                         kubectl set image deployment/flask-app flask-app=${IMAGE_TAG}
                         
-                        # Wait for rollout
+                        # --- 5. VERIFY ---
                         kubectl rollout status deployment/flask-app
                     '''
                 }
