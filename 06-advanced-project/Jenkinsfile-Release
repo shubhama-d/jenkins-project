@@ -48,12 +48,19 @@ pipeline {
             }
             steps {
                 sh '''
-                    set -eux
-                    cd "$WORKSPACE/06-advanced-project"
-                    tag=$(/var/lib/jenkins/.local/bin/poetry run semantic-release version)
-                    /var/lib/jenkins/.local/bin/poetry run semantic-release publish
-                    echo "Published new tag: $tag"
-                '''
+                   set -eux
+                   cd "$WORKSPACE"
+
+                   /var/lib/jenkins/.local/bin/poetry run semantic-release \
+                   version \
+                   --repository-dir "$WORKSPACE" \
+                   --config "$WORKSPACE/06-advanced-project/pyproject.toml"
+
+                   /var/lib/jenkins/.local/bin/poetry run semantic-release \
+                   publish \
+                   --repository-dir "$WORKSPACE" \
+                   --config "$WORKSPACE/06-advanced-project/pyproject.toml"
+        '''
             }
         }
 
