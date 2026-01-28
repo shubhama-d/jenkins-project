@@ -1,53 +1,93 @@
 pipeline {
     agent any
 
+    triggers {
+        githubPush()
+    }
+
     environment {
+        // Project structure
+        PROJECT_DIR = '06-advanced-project'
+
         // Azure / ACR
         ACR_NAME         = 'jekinsreg'
         ACR_LOGIN_SERVER = 'jekinsreg.azurecr.io'
         IMAGE_NAME       = "${ACR_LOGIN_SERVER}/jenkins-flask-app"
+        IMAGE_TAG        = "${IMAGE_NAME}:${env.GIT_COMMIT}"
 
         // AKS
         AKS_CLUSTER = 'jenkins-demo'
         AKS_RG      = 'shub-poc-rg'
 
-        // GitHub (for semantic-release)
+        // GitHub token (REQUIRED for semantic-release)
         GH_TOKEN = credentials('github-access-token')
     }
 
     stages {
 
-        /* ---------------- RELEASE STAGE ---------------- */
-        stage('Create Release (main branch only)') {
-            when {
-                allOf {
-                    branch 'main'
-                    not { buildingTag() }
+        stage('Detect Git Tag') {
+            steps {
+                script {
+                    env.GIT_TAG = sh(
+                        returnStdout: true,
+                        script: "git describe --tags --exact-match || true"
+                    ).trim()
+
+                    if (env.GIT_TAG) {
+                        env.IMAGE_TAG_RELEASE = "${IMAGE_NAME}:${env.GIT_TAG}"
+                        echo "Tag build detected: ${env.GIT_TAG}"
+                    } else {
+                        echo "No tag detected – normal build"
+                    }
                 }
+            }
+        }
+
+        stage('Setup Poetry') {
+            steps {
+                sh '''
+                    set -eux
+                    cd "$WORKSPACE/${PROJECT_DIR}"
+
+                    /var/lib/jenkins/.local/bin/poetry --version
+                    /var/lib/jenkins/.local/bin/poetry install --with dev
+                '''
+            }
+        }
+
+        stage('Fix Git Checkout (semantic-release)') {
+            steps {
+                sh '''
+                    set -eux
+
+                    git fetch --all --tags
+                    git checkout -B main origin/main
+
+                    git config --global user.email "jenkins@ci.local"
+                    git config --global user.name "jenkins-bot"
+                    git remote set-url origin https://${GH_TOKEN}@github.com/shubhama-d/jenkins-project.git
+                '''
+            }
+        }
+
+        stage('Create Release') {
+            when {
+                expression { env.GIT_TAG == "" }
             }
             steps {
                 sh '''
                     set -eux
-                    cd "$WORKSPACE/06-advanced-project"
+                    cd "$WORKSPACE/${PROJECT_DIR}"
 
-                    git config --global user.email "jenkins@ci.local"
-                    git config --global user.name "jenkins-bot"
-
-                    /var/lib/jenkins/.local/bin/poetry install --with dev
                     /var/lib/jenkins/.local/bin/poetry run semantic-release version
                     /var/lib/jenkins/.local/bin/poetry run semantic-release publish
                 '''
             }
         }
 
-        /* ---------------- BUILD & DEPLOY STAGE ---------------- */
-        stage('Build & Deploy (tag only)') {
+        stage('Build & Deploy (Tag Only)') {
             when {
-                buildingTag()
-            }
-
-            environment {
-                IMAGE_TAG = "${IMAGE_NAME}:${env.TAG_NAME}"
+                expression { env.GIT_TAG != "" }
             }
 
             stages {
@@ -55,18 +95,18 @@ pipeline {
                 stage('Azure Login') {
                     steps {
                         withCredentials([
-                            usernamePassword(credentialsId: 'azure-sp',
+                            usernamePassword(
+                                credentialsId: 'azure-sp',
                                 usernameVariable: 'AZURE_CLIENT_ID',
-                                passwordVariable: 'AZURE_CLIENT_SECRET'),
-                            string(credentialsId: 'azure-tenant-id',
-                                variable: 'AZURE_TENANT_ID'),
-                            string(credentialsId: 'azure-subscription-id',
-                                variable: 'AZURE_SUBSCRIPTION_ID')
+                                passwordVariable: 'AZURE_CLIENT_SECRET'
+                            ),
+                            string(credentialsId: 'azure-tenant-id', variable: 'AZURE_TENANT_ID'),
+                            string(credentialsId: 'azure-subscription-id', variable: 'AZURE_SUBSCRIPTION_ID')
                         ]) {
                             sh '''
                                 az login --service-principal \
-                                  -u $AZURE_CLIENT_ID \
-                                  -p $AZURE_CLIENT_SECRET \
+                                  --username $AZURE_CLIENT_ID \
+                                  --password $AZURE_CLIENT_SECRET \
                                   --tenant $AZURE_TENANT_ID
 
                                 az account set --subscription $AZURE_SUBSCRIPTION_ID
@@ -84,7 +124,9 @@ pipeline {
                 stage('Build Image') {
                     steps {
                         sh '''
-                            docker build -t ${IMAGE_TAG} .
+                            docker build \
+                              -t ${IMAGE_TAG} \
+                              -t ${IMAGE_TAG_RELEASE} .
                         '''
                     }
                 }
@@ -93,6 +135,7 @@ pipeline {
                     steps {
                         sh '''
                             docker push ${IMAGE_TAG}
+                            docker push ${IMAGE_TAG_RELEASE}
                         '''
                     }
                 }
@@ -106,7 +149,7 @@ pipeline {
                               --overwrite-existing
 
                             kubectl set image deployment/flask-app \
-                              flask-app=${IMAGE_TAG}
+                              flask-app=${IMAGE_TAG_RELEASE}
                         '''
                     }
                 }
