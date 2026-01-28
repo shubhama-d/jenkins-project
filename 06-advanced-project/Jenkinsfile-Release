@@ -54,7 +54,7 @@ pipeline {
             }
         }
 
-        stage('Azure Login') {
+        stage('Azure Login & Whitelist IP') {
             steps {
                 withCredentials([
                     usernamePassword(
@@ -67,23 +67,50 @@ pipeline {
                 ]) {
                     sh '''
                         set -eux
+                        
+                        # 1. Login to Azure CLI (needed for firewall changes)
                         az login --service-principal \
                           --username $AZURE_CLIENT_ID \
                           --password $AZURE_CLIENT_SECRET \
                           --tenant $AZURE_TENANT_ID
-
+                        
                         az account set --subscription $AZURE_SUBSCRIPTION_ID
+
+                        # 2. Get Agent Public IP
+                        # We use a third-party service to find the public IP of the current build agent
+                        AGENT_IP=$(curl -s https://api.ipify.org)
+                        echo "Detected Agent IP: $AGENT_IP"
+                        
+                        # 3. Add IP to ACR Firewall
+                        # We allow this IP so we can push images later
+                        echo "Whitelisting IP on ACR..."
+                        az acr network-rule add --name ${ACR_NAME} --ip-address $AGENT_IP
+                        
+                        # Save IP to a file so we can remove it in the 'post' block
+                        echo $AGENT_IP > agent_ip.txt
                     '''
                 }
             }
         }
 
-        stage('ACR Login') {
+        stage('ACR Login (Docker)') {
             steps {
-                sh '''
-                    set -eux
-                    az acr login --name ${ACR_NAME}
-                '''
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'azure-sp',
+                        usernameVariable: 'AZURE_CLIENT_ID',
+                        passwordVariable: 'AZURE_CLIENT_SECRET'
+                    )
+                ]) {
+                    sh '''
+                        set -eux
+                        # We use standard docker login instead of 'az acr login'
+                        # This avoids the "refresh token" error entirely
+                        echo $AZURE_CLIENT_SECRET | docker login ${ACR_LOGIN_SERVER} \
+                            --username $AZURE_CLIENT_ID \
+                            --password-stdin
+                    '''
+                }
             }
         }
 
@@ -113,6 +140,9 @@ pipeline {
                 sh '''
                     set -eux
 
+                    # Login again implicitly handled by previous az login, 
+                    # but good to ensure context if agents switch (not the case here with agent any usually)
+                    
                     az aks get-credentials \
                       --resource-group ${AKS_RG} \
                       --name ${AKS_CLUSTER} \
@@ -127,6 +157,33 @@ pipeline {
 
                     # Verify rollout
                     kubectl rollout status deployment/flask-app
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            // Cleanup: Remove the IP from the whitelist to keep the registry secure
+            withCredentials([
+                    usernamePassword(
+                        credentialsId: 'azure-sp',
+                        usernameVariable: 'AZURE_CLIENT_ID',
+                        passwordVariable: 'AZURE_CLIENT_SECRET'
+                    ),
+                    string(credentialsId: 'azure-tenant-id', variable: 'AZURE_TENANT_ID'),
+                    string(credentialsId: 'azure-subscription-id', variable: 'AZURE_SUBSCRIPTION_ID')
+                ]) {
+                sh '''
+                    if [ -f agent_ip.txt ]; then
+                        AGENT_IP=$(cat agent_ip.txt)
+                        echo "Removing IP $AGENT_IP from ACR firewall..."
+                        
+                        # We need to re-login in post block as environment might not persist perfectly in some setups
+                        az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID > /dev/null
+                        
+                        az acr network-rule remove --name ${ACR_NAME} --ip-address $AGENT_IP || true
+                    fi
                 '''
             }
         }
