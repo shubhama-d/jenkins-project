@@ -13,11 +13,8 @@ spec:
         app: flask-app
     spec:
       containers:
-      - name: flask-app
-        image: sanjeevkt720/jenkins-flask-app:v3
-        # resources:
-        #   limits:
-        #     memory: "128Mi"
-        #     cpu: "100m"
-        ports:
-        - containerPort: 5000
+        - name: flask-app
+          # Placeholder image – Jenkins will override this
+          image: jekinsreg.azurecr.io/jenkins-flask-app:latest
+          ports:
+            - containerPort: 5000
