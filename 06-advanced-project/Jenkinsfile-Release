@@ -60,11 +60,12 @@ pipeline {
         stage('Prisma Cloud Scan') {
             steps {
                 echo "--- STARTING VULNERABILITY SCAN ---"
-                // This will PASS unless you set a 'Block Threshold' in Prisma Console > Defend > CI
+                // ADDED 'logLevel' parameter here to fix the compilation error
                 prismaCloudScanImage dockerAddress: 'unix:///var/run/docker.sock', 
                                      image: "${IMAGE_TAG}", 
                                      resultsFile: 'prisma-cloud-scan-results.json',
-                                     ignoreImageBuildTime: true
+                                     ignoreImageBuildTime: true,
+                                     logLevel: 'info'
             }
         }
 
