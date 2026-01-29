@@ -7,13 +7,17 @@ pipeline {
 
     environment {
         PROJECT_DIR      = '06-advanced-project'
+        // Private Registry Details
         ACR_NAME         = 'jekinsregprivate'
         ACR_LOGIN_SERVER = "${ACR_NAME}.azurecr.io"
         IMAGE_NAME       = "${ACR_LOGIN_SERVER}/jenkins-flask-app"
         IMAGE_TAG        = "${IMAGE_NAME}:${env.GIT_COMMIT}"
+        
+        // AKS Details
         AKS_CLUSTER      = 'jenkins-demo'
         AKS_RG           = 'shub-poc-rg'
-        // Hardcoded version to prevent network timeouts/errors
+        
+        // Hardcoded kubectl to prevent network timeouts
         KUBECTL_VERSION  = 'v1.29.0' 
     }
 
@@ -28,26 +32,48 @@ pipeline {
             }
         }
 
-        stage('ACR Login (Docker)') {
+        stage('ACR Login') {
             steps {
                 withCredentials([
                     usernamePassword(credentialsId: 'azure-sp', usernameVariable: 'AZURE_CLIENT_ID', passwordVariable: 'AZURE_CLIENT_SECRET')
                 ]) {
                     sh '''
                         set -eux
-                        echo "Attempting Docker Login..."
+                        echo "Logging into Private Registry..."
                         echo $AZURE_CLIENT_SECRET | docker login ${ACR_LOGIN_SERVER} --username $AZURE_CLIENT_ID --password-stdin
                     '''
                 }
             }
         }
 
-        stage('Build & Push') {
+        stage('Build Image') {
             steps {
                 sh '''
                     set -eux
                     cd "$WORKSPACE/${PROJECT_DIR}"
+                    echo "Building Docker Image..."
                     docker build -t ${IMAGE_TAG} .
+                '''
+            }
+        }
+
+        stage('Prisma Cloud Scan') {
+            steps {
+                echo "--- STARTING VULNERABILITY SCAN ---"
+                // This will PASS unless you set a 'Block Threshold' in Prisma Console > Defend > CI
+                prismaCloudScanImage dockerAddress: 'unix:///var/run/docker.sock', 
+                                     image: "${IMAGE_TAG}", 
+                                     resultsFile: 'prisma-cloud-scan-results.json',
+                                     ignoreImageBuildTime: true
+            }
+        }
+
+        stage('Push Image') {
+            steps {
+                // This runs ONLY if the Scan passed (Green)
+                sh '''
+                    set -eux
+                    echo "Scan Passed. Pushing to Registry..."
                     docker push ${IMAGE_TAG}
                 '''
             }
@@ -63,40 +89,37 @@ pipeline {
                     sh '''
                         set -eux
                         
-                        # --- 1. LOGIN TO AZURE ---
+                        # 1. Login to Azure
                         az login --service-principal -u $AZURE_CLIENT_ID -p $AZURE_CLIENT_SECRET -t $AZURE_TENANT_ID
                         az account set --subscription $AZURE_SUBSCRIPTION_ID
                         
-                        # --- 2. INSTALL KUBECTL (Robust Method) ---
-                        # We use a specific version to avoid 'Timed out' errors on dynamic checks
+                        # 2. Install/Check kubectl
                         if ! command -v kubectl &> /dev/null; then
-                            echo "kubectl not found. Installing version $KUBECTL_VERSION locally..."
-                            
+                            echo "kubectl not found. Installing version $KUBECTL_VERSION..."
                             mkdir -p $WORKSPACE/bin
-                            
-                            # Download specific version directly (No sub-shell curl calls)
                             curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-                            
                             chmod +x kubectl
                             mv kubectl $WORKSPACE/bin/
                             export PATH=$WORKSPACE/bin:$PATH
-                        else
-                            echo "kubectl is already installed."
                         fi
 
-                        # Verify
-                        kubectl version --client
-
-                        # --- 3. CONFIGURE AKS ---
+                        # 3. Connect to AKS
                         az aks get-credentials --resource-group ${AKS_RG} --name ${AKS_CLUSTER} --overwrite-existing
                         
-                        # --- 4. DEPLOY ---
+                        # 4. Deploy
                         kubectl apply -f ${PROJECT_DIR}/k8s/deployment.yaml
                         kubectl set image deployment/flask-app flask-app=${IMAGE_TAG}
                         kubectl rollout status deployment/flask-app
                     '''
                 }
             }
+        }
+    }
+
+    post {
+        always {
+            // Publish graphs to Jenkins UI
+            prismaCloudPublish resultsFilePattern: 'prisma-cloud-scan-results.json'
         }
     }
 }
